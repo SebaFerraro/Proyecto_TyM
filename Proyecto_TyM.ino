@@ -2,12 +2,15 @@
 #include <ESPUI.h>
 #include <WiFi.h>
 #include <Preferences.h>
+#include "time.h"
+#include <Adafruit_MLX90614.h>
 
 
 const byte DNS_PORT = 53;
 IPAddress apIP( 192, 168, 1, 1 );
 DNSServer dnsServer;
 Preferences preference;
+Adafruit_MLX90614 mlx = Adafruit_MLX90614();
 
 
 //const char* ssid = "wifi";
@@ -19,6 +22,8 @@ String ssid;
 String pass;
 String mqttserver;
 String token;
+String senstemp;
+String senspuls;
 unsigned long pmed;
 unsigned long pguard;
 uint16_t dtatempg;
@@ -30,7 +35,125 @@ uint16_t switchOne;
 uint16_t cversion, cpulsostat, ctempstat, cwifistat, cntpstat, cmqttstat, csave;
 uint16_t pmedid, pguardid,dtatempgid,dtapulsoid,dtaspoid,graficarid,wifissidid,wifipassid,mqttserverid,tokenid,usuarioid,passwordid;
 int graphIdTemp, graphIdPulso, graphIdSPO;
+String wmode;
+String horaloc;
+float valtemp;
+float valtempamb;
 
+const long  gmtOffset_sec = -3 * 60 * 60;
+const int   daylightOffset_sec = 0;
+const char* ntpServer = "pool.ntp.org";
+bool SensorTemp = false;
+bool SensorPulso = false;
+
+void WiFiEvent(WiFiEvent_t event){
+    Serial.printf("[WiFi-event] event: %d\n", event);
+
+    switch (event) {
+        case ARDUINO_EVENT_WIFI_READY: 
+            Serial.println("WiFi interface ready");
+            break;
+        case ARDUINO_EVENT_WIFI_SCAN_DONE:
+            Serial.println("Completed scan for access points");
+            break;
+        case ARDUINO_EVENT_WIFI_STA_START:
+            Serial.println("WiFi client started");
+            break;
+        case ARDUINO_EVENT_WIFI_STA_STOP:
+            Serial.println("WiFi clients stopped");
+            break;
+        case ARDUINO_EVENT_WIFI_STA_CONNECTED:
+            Serial.println("Connected to access point");
+            break;
+        case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
+            Serial.println("Disconnected from WiFi access point");
+            break;
+        case ARDUINO_EVENT_WIFI_STA_AUTHMODE_CHANGE:
+            Serial.println("Authentication mode of access point has changed");
+            break;
+        case ARDUINO_EVENT_WIFI_STA_GOT_IP:
+            Serial.print("Obtained IP address: ");
+            Serial.println(WiFi.localIP());
+            break;
+        case ARDUINO_EVENT_WIFI_STA_LOST_IP:
+            Serial.println("Lost IP address and IP address is reset to 0");
+            break;
+        case ARDUINO_EVENT_WPS_ER_SUCCESS:
+            Serial.println("WiFi Protected Setup (WPS): succeeded in enrollee mode");
+            break;
+        case ARDUINO_EVENT_WPS_ER_FAILED:
+            Serial.println("WiFi Protected Setup (WPS): failed in enrollee mode");
+            break;
+        case ARDUINO_EVENT_WPS_ER_TIMEOUT:
+            Serial.println("WiFi Protected Setup (WPS): timeout in enrollee mode");
+            break;
+        case ARDUINO_EVENT_WPS_ER_PIN:
+            Serial.println("WiFi Protected Setup (WPS): pin code in enrollee mode");
+            break;
+        case ARDUINO_EVENT_WIFI_AP_START:
+            Serial.println("WiFi access point started");
+            break;
+        case ARDUINO_EVENT_WIFI_AP_STOP:
+            Serial.println("WiFi access point  stopped");
+            break;
+        case ARDUINO_EVENT_WIFI_AP_STACONNECTED:
+            Serial.println("Client connected");
+            break;
+        case ARDUINO_EVENT_WIFI_AP_STADISCONNECTED:
+            Serial.println("Client disconnected");
+            break;
+        case ARDUINO_EVENT_WIFI_AP_STAIPASSIGNED:
+            Serial.println("Assigned IP address to client");
+            break;
+        case ARDUINO_EVENT_WIFI_AP_PROBEREQRECVED:
+            Serial.println("Received probe request");
+            break;
+        case ARDUINO_EVENT_WIFI_AP_GOT_IP6:
+            Serial.println("AP IPv6 is preferred");
+            break;
+        case ARDUINO_EVENT_WIFI_STA_GOT_IP6:
+            Serial.println("STA IPv6 is preferred");
+            break;
+        case ARDUINO_EVENT_ETH_GOT_IP6:
+            Serial.println("Ethernet IPv6 is preferred");
+            break;
+        case ARDUINO_EVENT_ETH_START:
+            Serial.println("Ethernet started");
+            break;
+        case ARDUINO_EVENT_ETH_STOP:
+            Serial.println("Ethernet stopped");
+            break;
+        case ARDUINO_EVENT_ETH_CONNECTED:
+            Serial.println("Ethernet connected");
+            break;
+        case ARDUINO_EVENT_ETH_DISCONNECTED:
+            Serial.println("Ethernet disconnected");
+            break;
+        case ARDUINO_EVENT_ETH_GOT_IP:
+            Serial.println("Obtained IP address");
+            break;
+        default: break;
+    }}
+
+String modo_wifi(void){
+  int wm= WiFi.getMode();
+  String salida="";
+  String ip = WiFi.localIP().toString().c_str();
+  if( wm == WIFI_AP ){
+    salida="Access Point:";
+  }
+  if ( wm == WIFI_STA ){
+    salida="Cliente:";
+  }
+  if ( wm == WIFI_AP_STA ){
+    salida="AP Cliente:";
+  }
+  if ( wm == WIFI_OFF ){
+    salida="Apagado:";
+  }
+  salida+=ip;
+  return salida;
+}
 
 void conf_default(void) {
   preference.putString("usuario", "admin");
@@ -60,6 +183,7 @@ void conf_save(void) {
   preference.putUInt("dtatempg", dtatempg);
   preference.putUInt("dtapulso", dtapulso);
   preference.putUInt("dtaspo", dtaspo);
+  versionc++;
   preference.putULong("version", versionc);
 }
 
@@ -207,8 +331,30 @@ void otherSwitchExample( Control* sender, int value ) {
 }
 
 
+String tiempolocal(){
+  struct tm timeinfo;
+  char salhora[23];
+  String sh;
+  if(!getLocalTime(&timeinfo)){
+    Serial.println("Error al obtener la fecha y hora!");
+    return sh;
+  }
+  strftime(salhora,23, "%F %T", &timeinfo);
+  sh=String(salhora);
+  Serial.print("Fecha: ");
+  Serial.println(sh);
+  return sh;
+}
+
+
 void setup( void ) {
   Serial.begin( 115200 );
+  WiFi.disconnect(true);
+  delay(1000);
+  pinMode(21,INPUT_PULLUP);
+  pinMode(22,INPUT_PULLUP);
+  
+  WiFi.onEvent(WiFiEvent);
   bool sal = get_conf();
   if (! sal ) {
     Serial.println("No habia configuracion.");
@@ -248,12 +394,22 @@ void setup( void ) {
 
   dnsServer.start( DNS_PORT, "*", apIP );
 
-  Serial.println( "\n\nWiFi parameters:" );
-  Serial.print( "Mode: " );
-  Serial.println( WiFi.getMode() == WIFI_AP ? "Station" : "Client" );
-  Serial.print( "IP address: " );
-  Serial.println( WiFi.getMode() == WIFI_AP ? WiFi.softAPIP() : WiFi.localIP() );
-
+  Serial.print( "\n\nWiFi parameters:" );
+  wmode=modo_wifi();
+  Serial.println( wmode );
+  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+  horaloc=tiempolocal();
+  
+  if (mlx.begin()) {
+    SensorTemp=true;
+    senstemp="Conectado";
+    Serial.print("Sensor Temp Emisividad = "); Serial.println(mlx.readEmissivity());
+  }else{
+    Serial.println("Error el Sensor de Temperatura DESCONECTADO.");
+    senstemp="Desconectado";
+    SensorTemp=false;
+  }
+  
   uint16_t tab1 = ESPUI.addControl( ControlType::Tab, "datos", "Datos" );
   uint16_t tab2 = ESPUI.addControl( ControlType::Tab, "conexion", "Conexion" );
   Serial.print("tab1 :");
@@ -264,9 +420,9 @@ void setup( void ) {
   // shown above all tabs
   cversion = ESPUI.addControl( ControlType::Label, "Conf Version:", String(versionc), ControlColor::Turquoise );
   cpulsostat = ESPUI.addControl( ControlType::Label, "Sensor Pulso:", "Desconectado", ControlColor::Turquoise );
-  ctempstat = ESPUI.addControl( ControlType::Label, "Sensor Temperatura:", "Desconectado", ControlColor::Turquoise );
-  cwifistat = ESPUI.addControl( ControlType::Label, "Modo Wifi:", "AP", ControlColor::Turquoise );
-  cntpstat = ESPUI.addControl( ControlType::Label, "Servidor NTP:", "Desconectado", ControlColor::Turquoise );
+  ctempstat = ESPUI.addControl( ControlType::Label, "Sensor Temperatura:", senstemp, ControlColor::Turquoise );
+  cwifistat = ESPUI.addControl( ControlType::Label, "Modo Wifi:", wmode, ControlColor::Turquoise );
+  cntpstat = ESPUI.addControl( ControlType::Label, "Servidor NTP:", horaloc, ControlColor::Turquoise );
   cmqttstat = ESPUI.addControl( ControlType::Label, "Servidor MQTT", "Desconectado", ControlColor::Turquoise );
   csave = ESPUI.addControl(ControlType::Button, "Configuracion", "Guardar", ControlColor::Turquoise, Control::noParent,&buttonCallback );
   
@@ -308,7 +464,7 @@ void setup( void ) {
   */
 
 
-  ESPUI.begin("Brazalete SMART", "admin", "admin");
+  ESPUI.begin("Brazalete SMART", usuario.c_str(), password.c_str());
   muestra_ids();
 }
 
@@ -321,10 +477,14 @@ void loop( void ) {
   if ( millis() - oldTime > 5000 ) {
     //switchi = !switchi;
     //ESPUI.updateControlValue( switchOne, switchi ? "1" : "0" );
-    uint16_t temp=random(1, 50);
-    Serial.print( "Temperatura:" );
-    Serial.println( temp);
-    ESPUI.addGraphPoint(graphIdTemp, temp);
+    if(SensorTemp){
+      valtemp=mlx.readObjectTempC();
+      valtempamb=mlx.readAmbientTempC();
+      Serial.print("Ambient = "); Serial.print(valtempamb);
+      Serial.print("*C\tObject = "); Serial.print(valtemp); Serial.println("*C");
+      ESPUI.addGraphPoint(graphIdTemp, valtemp);
+    }
+    
     //ESPUI.addGraphPoint(graphIdPulso, random(1, 50));
     //ESPUI.addGraphPoint(graphIdSPO, random(1, 50));
 
