@@ -4,14 +4,40 @@
 #include <Preferences.h>
 #include "time.h"
 #include <Adafruit_MLX90614.h>
+#include <PubSubClient.h>
+#include <ArduinoJson.h>
+#include "MAX30105.h"
+#include "heartRate.h"
+#include "spo2_algorithm.h"
 
-
+TaskHandle_t Tareacore0;
 const byte DNS_PORT = 53;
 IPAddress apIP( 192, 168, 1, 1 );
 DNSServer dnsServer;
 Preferences preference;
 Adafruit_MLX90614 mlx = Adafruit_MLX90614();
+double new_emissivity = 0.98;
+MAX30105 particleSensor;
 
+#define bufferLength 200 //buffer length of 100 stores 4 seconds of samples running at 25sps
+#define ANALOG_PIN_0 34 
+
+long lastBeat = 0; //Time at which the last beat occurred
+uint32_t irBuffer[200]; //infrared LED sensor data
+uint32_t redBuffer[200];  //red LED sensor data
+float beatsPerMinute=0;
+int32_t spo2=0; //SPO2 value
+int8_t validSPO2=0; //indicator to show if the SPO2 calculation is valid
+int32_t heartRate=0; //heart rate value calcualated as per Maxim's algorithm
+int8_t validHeartRate=0; //indicator to show if the heart rate calculation is valid
+int beatAvg = 0, sp02Avg = 0; //stores the average BPM and SPO2 
+
+byte ledBrightness = 50; //Options: 0=Off to 255=50mA
+byte sampleAverage = 8; //Options: 1, 2, 4, 8, 16, 32
+byte ledMode = 2; //Options: 1 = Red only, 2 = Red + IR, 3 = Red + IR + Green
+byte sampleRate = 200; //Options: 50, 100, 200, 400, 800, 1000, 1600, 3200
+int pulseWidth = 69; //Options: 69, 118, 215, 411
+int adcRange = 4096; //Options: 2048, 4096, 8192, 16384
 
 //const char* ssid = "wifi";
 //const char* password = "secret1703secret1703";
@@ -31,14 +57,15 @@ uint16_t dtapulso;
 uint16_t dtaspo;
 unsigned long versionc;
 uint16_t button1;
-uint16_t switchOne;
+bool switchOne;
 uint16_t cversion, cpulsostat, ctempstat, cwifistat, cntpstat, cmqttstat, csave;
 uint16_t pmedid, pguardid,dtatempgid,dtapulsoid,dtaspoid,graficarid,wifissidid,wifipassid,mqttserverid,tokenid,usuarioid,passwordid;
 int graphIdTemp, graphIdPulso, graphIdSPO;
 String wmode;
 String horaloc;
-float valtemp;
-float valtempamb;
+float valtemp=0;
+float valtempamb=0;
+float vcc=0;
 
 const long  gmtOffset_sec = -3 * 60 * 60;
 const int   daylightOffset_sec = 0;
@@ -46,9 +73,12 @@ const char* ntpServer = "pool.ntp.org";
 bool SensorTemp = false;
 bool SensorPulso = false;
 
+WiFiClient espClient;
+PubSubClient client(espClient);
+
 void WiFiEvent(WiFiEvent_t event){
     Serial.printf("[WiFi-event] event: %d\n", event);
-
+    Serial.println("WiFiEvent Nucleo:" + String(xPortGetCoreID()));
     switch (event) {
         case ARDUINO_EVENT_WIFI_READY: 
             Serial.println("WiFi interface ready");
@@ -139,6 +169,8 @@ String modo_wifi(void){
   int wm= WiFi.getMode();
   String salida="";
   String ip = WiFi.localIP().toString().c_str();
+  Serial.println("ModoWiFi Nucleo:" + String(xPortGetCoreID()));
+    
   if( wm == WIFI_AP ){
     salida="Access Point:";
   }
@@ -155,6 +187,166 @@ String modo_wifi(void){
   return salida;
 }
 
+void send_mqtt(int32_t spo, int32_t hr, int spoav, int hrav, float v, float temp){
+  Serial.println("sendmqtt Nucleo:" + String(xPortGetCoreID()));
+  if(!client.connected()) {
+      ESPUI.updateControlValue( cmqttstat, "Desconectado." );
+      Serial.print("Conectando ThingsBoard node ...");
+      if ( client.connect("BrazaleteSmart01", token.c_str(), NULL) ) {
+        Serial.println( "[DONE]" );
+        delay(1000);
+      } else {
+        Serial.print( "[FAILED] [ rc = " );
+        Serial.print( client.state() );
+      }
+    }  
+    if (client.connected()) {
+      ESPUI.updateControlValue( cmqttstat, "Conectado." );
+      String spo2 = String(spo);
+      String pulso = String(hr);
+      String promspo2 = String(spoav);
+      String prompulso= String(hrav);
+      String temperatura = String(temp);
+      String vbat = String(v);
+      
+      String payload = "{";
+      payload += "\"spo2\":";
+      payload += spo2;
+      payload += ",";
+      payload += "\"pulso\":";
+      payload += pulso;
+      payload += ",";
+      payload += "\"promspo2\":";
+      payload += promspo2;
+      payload += ",";
+      payload += "\"prompulso\":";
+      payload += prompulso;
+      payload += ",";
+      payload += "\"temperatura\":";
+      payload += temperatura;
+      payload += ",";
+      payload += "\"vbat\":";
+      payload += vbat;
+      payload += "}";
+
+      // Send payload
+      char attributes[200];
+      payload.toCharArray( attributes, 200 );
+      int rsus=client.publish( "v1/devices/me/telemetry", attributes );
+      Serial.print( "Publish : ");
+      Serial.println(rsus);
+      //client.publish(TEMP_TOPIC, msg);
+      Serial.println( attributes );
+    }
+  }
+
+
+float get_vcc(){
+  Serial.println("getvcc Nucleo:" + String(xPortGetCoreID()));
+  int steps=analogRead(ANALOG_PIN_0);
+  Serial.print("Voltage Steps = ");
+  Serial.println(steps);
+  float VBAT = 3.90f * float(steps) / 4096.0f *2;  // LiPo battery
+  return VBAT;
+}
+
+
+void correcore0( void * parameter) {
+  Serial.println("Correcore0 Nucleo:" + String(xPortGetCoreID()));
+  //long irValue = particleSensor.getIR();
+  if (mlx.begin()) {
+    SensorTemp=true;
+    //mlx.writeEmissivity(new_emissivity);
+    senstemp="Conectado";
+    Serial.print("Sensor Temp Emisividad Temp TempAmb = "); Serial.print(mlx.readEmissivity());//Serial.print(mlx.readObjectTempC());Serial.println(mlx.readAmbientTempC());
+  }else{
+    Serial.println("Error el Sensor de Temperatura DESCONECTADO.");
+    senstemp="Desconectado";
+    SensorTemp=false;
+  }
+  delay(500);
+  //Wire, I2C_SPEED_FAST
+  if (particleSensor.begin()){
+    SensorPulso=true;
+    senspuls="Conectado";
+    particleSensor.setup(ledBrightness, sampleAverage, ledMode, sampleRate, pulseWidth, adcRange);
+    particleSensor.setPulseAmplitudeRed(0x30); //Turn Red LED to low to indicate sensor is running
+    //particleSensor.setPulseAmplitudeGreen(0); //Turn off Green LED
+    Serial.println("Sensor de PULSO Conectado.");
+  }else{
+    Serial.println("Error el Sensor de PULSO DESCONECTADO.");
+    SensorPulso=false;
+    senspuls="Desconectado";
+  }
+  delay(500);
+  byte i = 0;
+  static long oldTMed = 0;
+  int avail=0;
+  while(true){
+    if(SensorPulso){
+      //long irValue = particleSensor.getIR();
+      //Serial.println(irValue);
+      avail=particleSensor.available();
+      //Serial.print("Avail:");
+      //Serial.println(avail);
+      if( avail>0 ){
+        particleSensor.check(); //Check the sensor for new data
+        redBuffer[i] = particleSensor.getRed();
+        irBuffer[i] = particleSensor.getIR();
+        particleSensor.nextSample(); //We're finished with this sample so move to next sample
+        i++;
+        Serial.print("I:");
+        Serial.println(i);
+      }
+      if(i>=200){
+        maxim_heart_rate_and_oxygen_saturation(irBuffer, bufferLength, redBuffer, &spo2, &validSPO2, &heartRate, &validHeartRate);
+        long irValue = irBuffer[i-1];
+        i=0;
+        if (checkForBeat(irValue) == true){
+          long delta = millis() - lastBeat;
+          lastBeat = millis();
+          if(delta>0){
+            beatsPerMinute = 60 / (delta / 1000.0);
+            if (beatsPerMinute < 255 && beatsPerMinute > 20){
+              if(beatAvg>0){
+                beatAvg = (beatAvg+beatsPerMinute)/2;
+              }else{
+                beatAvg = beatsPerMinute;
+              }
+            }
+          }
+        }
+        if(validSPO2 == 1 && spo2 < 100 && spo2 > 0){
+          sp02Avg = (sp02Avg+spo2)/2;
+        }
+        Serial.print(F("HR="));
+        Serial.print(heartRate, DEC);
+        Serial.print(F("\t HRAVG="));
+        Serial.print(beatAvg, DEC);
+        Serial.print(F("\t HRvalid="));
+        Serial.print(validHeartRate, DEC);
+        Serial.print(F("\t SPO2="));
+        Serial.print( spo2 , DEC);
+        Serial.print(F("\t SPO2AVG="));
+        Serial.print( sp02Avg , DEC);
+        Serial.print(F("\t SPO2Valid="));
+        Serial.println(validSPO2, DEC);
+     }
+     if(SensorTemp){
+         if ( millis() - oldTMed > 5000 ) {
+           //Serial.print("Sensor Temp Emisividad = "); Serial.println(mlx.readEmissivity());
+           valtemp=mlx.readObjectTempC();
+           valtempamb=mlx.readAmbientTempC();
+           oldTMed = millis();
+         }
+     }
+    vTaskDelay(20);
+  }else{
+    vTaskDelay(500);
+  }
+ }
+}
+
 void conf_default(void) {
   preference.putString("usuario", "admin");
   preference.putString("password", "admin");
@@ -162,8 +354,8 @@ void conf_default(void) {
   preference.putString("pass", "admin");
   preference.putString("mqttserver", "192.168.0.1");
   preference.putString("token", "0000000000000000");
-  preference.putULong("pmed", 30000);
-  preference.putULong("pguard", 600000);
+  preference.putULong("pmed", 30);
+  preference.putULong("pguard", 60);
   preference.putUInt("dtatempg", 20);
   preference.putUInt("dtapulso", 20);
   preference.putUInt("dtaspo", 10);
@@ -172,6 +364,7 @@ void conf_default(void) {
 
 //String usuario,String password,String ssid,String pass,String mqttserver,String token,unsigned long pmed,unsigned long pguard,uint16_t dtatempg,uint16_t dtapulso,uint16_t dtaspo,unsigned long version
 void conf_save(void) {
+  Serial.println("ConfSave Nucleo:" + String(xPortGetCoreID()));
   preference.putString("usuario",usuario );
   preference.putString("password", password);
   preference.putString("ssid", ssid);
@@ -189,6 +382,8 @@ void conf_save(void) {
 
 bool get_conf(void) {
   preference.begin("configuracion", false);
+  Serial.println("GetConf Nucleo:" + String(xPortGetCoreID()));
+    
   Serial.print( "\nConfigurando .....\n" );
   
   if (preference.getUInt("version", 0) > 0) {
@@ -198,8 +393,8 @@ bool get_conf(void) {
     pass = preference.getString("pass", "secret1703secret1703");
     mqttserver = preference.getString("mqttserver", "192.168.0.1");
     token = preference.getString("token", "0000000000000000");
-    pmed = preference.getULong("pmed", 30000);
-    pguard = preference.getULong("pguard", 600000);
+    pmed = preference.getULong("pmed", 30);
+    pguard = preference.getULong("pguard", 60);
     dtatempg = preference.getUInt("dtatempg", 20);
     dtapulso = preference.getUInt("dtapulso", 20);
     dtaspo = preference.getUInt("dtaspo", 10);
@@ -215,11 +410,14 @@ bool get_conf(void) {
     return false;
   }
 }
+
 void muestra_ids(){
+  Serial.println("MuestraIds Nucleo:" + String(xPortGetCoreID()));
   Serial.println(" cversion:" + String(cversion) + " cpulsostat:" + String(cpulsostat) + " ctempstat:" + String(ctempstat) + " cwifistat:" + String(cwifistat) + " cntpstat:" + String(cntpstat) + " cmqttstat:" + String(cmqttstat) + " pmedid:" + String(pmedid) + " pguardid:" + String(pguardid) + " dtatempgid:" + String(dtatempgid) + " dtapulsoid:" + String(dtapulsoid) + " dtaspoid:" + String(dtaspoid) + " graficarid:" + String(graficarid) + " wifissidid:" + String(wifissidid) + " wifipassid:" + String(wifipassid) + " mqttserverid:" + String(mqttserverid) + " tokenid:" + String(tokenid) + " usuarioid:" +  String(usuarioid) + " passwordid:" + String(passwordid) + " graphIdTemp:" + String(graphIdTemp) + " graphIdPulso:" + String(graphIdPulso) + " graphIdSPO:" + String(graphIdSPO));
 }
 
 void numberCall( Control* sender, int type ) {
+  Serial.println("NumberCall Nucleo:" + String(xPortGetCoreID()));
   Serial.print("Num: ID: ");
   Serial.print(sender->id);
   Serial.print(", Value: ");
@@ -235,6 +433,7 @@ void numberCall( Control* sender, int type ) {
 }
 
 void textCall( Control* sender, int type ) {
+  Serial.println("textCall Nucleo:" + String(xPortGetCoreID()));
   Serial.print("Text: ID: ");
   Serial.print(sender->id);
   Serial.print(", Value: ");
@@ -263,6 +462,7 @@ void textCall( Control* sender, int type ) {
 }
 
 void slider( Control* sender, int type ) {
+  Serial.println("Slider Nucleo:" + String(xPortGetCoreID()));
   Serial.print("Slider: ID: ");
   Serial.print(sender->id);
   Serial.print(", Value: ");
@@ -282,6 +482,7 @@ void slider( Control* sender, int type ) {
 }
 
 void buttonCallback( Control* sender, int type ) {
+  Serial.println("buttonCallBack Nucleo:" + String(xPortGetCoreID()));
   Serial.print("Button: ID: ");
   Serial.print(sender->id);
   Serial.print(", Value: ");
@@ -292,6 +493,7 @@ void buttonCallback( Control* sender, int type ) {
     case B_DOWN:
       Serial.println( "Button DOWN" );
       conf_save();
+      ESPUI.updateControlValue( cversion, String(versionc) );
       break;
 
     case B_UP:
@@ -301,6 +503,7 @@ void buttonCallback( Control* sender, int type ) {
 }
 
 void switchExample( Control* sender, int value ) {
+  Serial.println("SwitchExample Nucleo:" + String(xPortGetCoreID()));
   switch ( value ) {
     case S_ACTIVE:
       Serial.print( "Active:" );
@@ -316,13 +519,16 @@ void switchExample( Control* sender, int value ) {
 }
 
 void otherSwitchExample( Control* sender, int value ) {
+  Serial.println("otherSwitchexample Nucleo:" + String(xPortGetCoreID()));
   switch ( value ) {
     case S_ACTIVE:
       Serial.print( "Active:" );
+      switchOne=true;
       break;
 
     case S_INACTIVE:
       Serial.print( "Inactive" );
+      switchOne=false;
       break;
   }
 
@@ -332,6 +538,7 @@ void otherSwitchExample( Control* sender, int value ) {
 
 
 String tiempolocal(){
+  Serial.println("tiempolocal Nucleo:" + String(xPortGetCoreID()));
   struct tm timeinfo;
   char salhora[23];
   String sh;
@@ -349,10 +556,17 @@ String tiempolocal(){
 
 void setup( void ) {
   Serial.begin( 115200 );
+  Serial.println("setup Nucleo:" + String(xPortGetCoreID()));
   WiFi.disconnect(true);
   delay(1000);
   pinMode(21,INPUT_PULLUP);
   pinMode(22,INPUT_PULLUP);
+  delay(500);
+  
+  analogReadResolution(12); //12 bits
+  analogSetAttenuation(ADC_11db);  //For all pins
+  analogSetPinAttenuation(ANALOG_PIN_0, ADC_11db); //0db attenu
+  delay(400);
   
   WiFi.onEvent(WiFiEvent);
   bool sal = get_conf();
@@ -364,8 +578,7 @@ void setup( void ) {
   WiFi.begin( ssid.c_str(), pass.c_str());
   Serial.print( "\n\nTry to connect to existing network" );
 
-  {
-    uint8_t timeout = 10;
+  uint8_t timeout = 10;
 
     // Wait for connection, 5s timeout
     do {
@@ -390,7 +603,7 @@ void setup( void ) {
         timeout--;
       } while ( timeout );
     }
-  }
+  
 
   dnsServer.start( DNS_PORT, "*", apIP );
 
@@ -399,16 +612,9 @@ void setup( void ) {
   Serial.println( wmode );
   configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
   horaloc=tiempolocal();
+  client.setServer(mqttserver.c_str(), 1884);
   
-  if (mlx.begin()) {
-    SensorTemp=true;
-    senstemp="Conectado";
-    Serial.print("Sensor Temp Emisividad = "); Serial.println(mlx.readEmissivity());
-  }else{
-    Serial.println("Error el Sensor de Temperatura DESCONECTADO.");
-    senstemp="Desconectado";
-    SensorTemp=false;
-  }
+  xTaskCreatePinnedToCore(correcore0,"TareaCore0",10000,NULL,1,&Tareacore0,0);
   
   uint16_t tab1 = ESPUI.addControl( ControlType::Tab, "datos", "Datos" );
   uint16_t tab2 = ESPUI.addControl( ControlType::Tab, "conexion", "Conexion" );
@@ -419,7 +625,7 @@ void setup( void ) {
    
   // shown above all tabs
   cversion = ESPUI.addControl( ControlType::Label, "Conf Version:", String(versionc), ControlColor::Turquoise );
-  cpulsostat = ESPUI.addControl( ControlType::Label, "Sensor Pulso:", "Desconectado", ControlColor::Turquoise );
+  cpulsostat = ESPUI.addControl( ControlType::Label, "Sensor Pulso:", senspuls, ControlColor::Turquoise );
   ctempstat = ESPUI.addControl( ControlType::Label, "Sensor Temperatura:", senstemp, ControlColor::Turquoise );
   cwifistat = ESPUI.addControl( ControlType::Label, "Modo Wifi:", wmode, ControlColor::Turquoise );
   cntpstat = ESPUI.addControl( ControlType::Label, "Servidor NTP:", horaloc, ControlColor::Turquoise );
@@ -471,23 +677,33 @@ void setup( void ) {
 void loop( void ) {
   dnsServer.processNextRequest();
 
-  static long oldTime = 0;
+  static long oldTMed = 0;
   static bool switchi = false;
 
-  if ( millis() - oldTime > 5000 ) {
+  if ( millis() - oldTMed >  (pmed * 1000 )) {
     //switchi = !switchi;
     //ESPUI.updateControlValue( switchOne, switchi ? "1" : "0" );
     if(SensorTemp){
-      valtemp=mlx.readObjectTempC();
-      valtempamb=mlx.readAmbientTempC();
       Serial.print("Ambient = "); Serial.print(valtempamb);
       Serial.print("*C\tObject = "); Serial.print(valtemp); Serial.println("*C");
-      ESPUI.addGraphPoint(graphIdTemp, valtemp);
+      if (switchOne){
+        ESPUI.addGraphPoint(graphIdTemp, valtemp);
+      }
     }
-    
-    //ESPUI.addGraphPoint(graphIdPulso, random(1, 50));
-    //ESPUI.addGraphPoint(graphIdSPO, random(1, 50));
-
-    oldTime = millis();
+    //spo2 heartRate beatAvg sp02Avg
+       
+    if(SensorPulso){
+      Serial.print("heartrate/HRAv = "); Serial.print(heartRate);Serial.print("/");Serial.print(beatAvg);
+      Serial.print("\t SPO2= "); Serial.print(spo2); ;Serial.print("/");Serial.print(sp02Avg);Serial.println("*C");
+      if (switchOne){
+        ESPUI.addGraphPoint(graphIdPulso, heartRate);
+        ESPUI.addGraphPoint(graphIdSPO, spo2);
+      }
+    }
+    Serial.println("loop Nucleo:" + String(xPortGetCoreID()));
+    //int32_t spo, int32_t hr, int spoav, int hrav, float v, float temp
+    vcc=get_vcc();
+    send_mqtt(spo2,heartRate,sp02Avg,beatAvg,vcc,valtemp);
+    oldTMed = millis();
   }
 }
