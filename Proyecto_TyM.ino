@@ -6,9 +6,8 @@
 #include <Adafruit_MLX90614.h>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
-#include "MAX30105.h"
-#include "heartRate.h"
-#include "spo2_algorithm.h"
+#include "MAX30100_PulseOximeter.h"
+#include <Wire.h>
 
 TaskHandle_t Tareacore0;
 const byte DNS_PORT = 53;
@@ -17,27 +16,19 @@ DNSServer dnsServer;
 Preferences preference;
 Adafruit_MLX90614 mlx = Adafruit_MLX90614();
 double new_emissivity = 0.98;
-MAX30105 particleSensor;
+PulseOximeter pox;
 
-#define bufferLength 200 //buffer length of 100 stores 4 seconds of samples running at 25sps
 #define ANALOG_PIN_0 34 
+#define REPORTING_PERIOD_TEMP_MS     10000
+#define REPORTING_PERIOD_PULS_MS     2000
+#define IRLEDCURR  MAX30100_LED_CURR_11MA
 
-long lastBeat = 0; //Time at which the last beat occurred
-uint32_t irBuffer[200]; //infrared LED sensor data
-uint32_t redBuffer[200];  //red LED sensor data
+
 float beatsPerMinute=0;
-int32_t spo2=0; //SPO2 value
-int8_t validSPO2=0; //indicator to show if the SPO2 calculation is valid
-int32_t heartRate=0; //heart rate value calcualated as per Maxim's algorithm
-int8_t validHeartRate=0; //indicator to show if the heart rate calculation is valid
-int beatAvg = 0, sp02Avg = 0; //stores the average BPM and SPO2 
+int8_t spo2=0; //SPO2 value
+int8_t sp02Avg = 0;
+float beatAvg = 0  ;
 
-byte ledBrightness = 50; //Options: 0=Off to 255=50mA
-byte sampleAverage = 8; //Options: 1, 2, 4, 8, 16, 32
-byte ledMode = 2; //Options: 1 = Red only, 2 = Red + IR, 3 = Red + IR + Green
-byte sampleRate = 200; //Options: 50, 100, 200, 400, 800, 1000, 1600, 3200
-int pulseWidth = 69; //Options: 69, 118, 215, 411
-int adcRange = 4096; //Options: 2048, 4096, 8192, 16384
 
 //const char* ssid = "wifi";
 //const char* password = "secret1703secret1703";
@@ -187,6 +178,11 @@ String modo_wifi(void){
   return salida;
 }
 
+void onBeatDetected()
+{
+   Serial.println("Pulso ! " + String(xPortGetCoreID()));
+}
+
 void send_mqtt(int32_t spo, int32_t hr, int spoav, int hrav, float v, float temp){
   Serial.println("sendmqtt Nucleo:" + String(xPortGetCoreID()));
   if(!client.connected()) {
@@ -253,98 +249,46 @@ float get_vcc(){
 
 void correcore0( void * parameter) {
   Serial.println("Correcore0 Nucleo:" + String(xPortGetCoreID()));
-  //long irValue = particleSensor.getIR();
-  if (mlx.begin()) {
-    SensorTemp=true;
-    //mlx.writeEmissivity(new_emissivity);
-    senstemp="Conectado";
-    Serial.print("Sensor Temp Emisividad Temp TempAmb = "); Serial.print(mlx.readEmissivity());//Serial.print(mlx.readObjectTempC());Serial.println(mlx.readAmbientTempC());
-  }else{
-    Serial.println("Error el Sensor de Temperatura DESCONECTADO.");
-    senstemp="Desconectado";
-    SensorTemp=false;
-  }
-  delay(500);
-  //Wire, I2C_SPEED_FAST
-  if (particleSensor.begin()){
-    SensorPulso=true;
-    senspuls="Conectado";
-    particleSensor.setup(ledBrightness, sampleAverage, ledMode, sampleRate, pulseWidth, adcRange);
-    particleSensor.setPulseAmplitudeRed(0x30); //Turn Red LED to low to indicate sensor is running
-    //particleSensor.setPulseAmplitudeGreen(0); //Turn off Green LED
-    Serial.println("Sensor de PULSO Conectado.");
-  }else{
-    Serial.println("Error el Sensor de PULSO DESCONECTADO.");
-    SensorPulso=false;
-    senspuls="Desconectado";
-  }
-  delay(500);
-  byte i = 0;
+  static long tsLastReport = 0;
   static long oldTMed = 0;
   int avail=0;
+  bool buclepuls=true;
   while(true){
-    if(SensorPulso){
-      //long irValue = particleSensor.getIR();
-      //Serial.println(irValue);
-      avail=particleSensor.available();
-      //Serial.print("Avail:");
-      //Serial.println(avail);
-      if( avail>0 ){
-        particleSensor.check(); //Check the sensor for new data
-        redBuffer[i] = particleSensor.getRed();
-        irBuffer[i] = particleSensor.getIR();
-        particleSensor.nextSample(); //We're finished with this sample so move to next sample
-        i++;
-        Serial.print("I:");
-        Serial.println(i);
-      }
-      if(i>=200){
-        maxim_heart_rate_and_oxygen_saturation(irBuffer, bufferLength, redBuffer, &spo2, &validSPO2, &heartRate, &validHeartRate);
-        long irValue = irBuffer[i-1];
-        i=0;
-        if (checkForBeat(irValue) == true){
-          long delta = millis() - lastBeat;
-          lastBeat = millis();
-          if(delta>0){
-            beatsPerMinute = 60 / (delta / 1000.0);
-            if (beatsPerMinute < 255 && beatsPerMinute > 20){
-              if(beatAvg>0){
-                beatAvg = (beatAvg+beatsPerMinute)/2;
-              }else{
-                beatAvg = beatsPerMinute;
-              }
+     if(SensorPulso){
+        while(buclepuls){
+          pox.update();
+            if (millis() - tsLastReport > REPORTING_PERIOD_PULS_MS) {
+               float bPMt=pox.getHeartRate();
+               int spot=pox.getSpO2();
+               Serial.print("Heart rate:");
+               Serial.print(bPMt);
+               Serial.print("bpm / SpO2:");
+               Serial.print(spot);
+               Serial.println("%");
+               buclepuls=false;
+               if(spot < 100 && spot > 70){
+                  spo2 = spot;
+                  sp02Avg = (sp02Avg + spo2)/2;
+               }
+               if(bPMt < 255 && bPMt > 38){
+                  beatsPerMinute=bPMt;
+                  beatAvg = (beatAvg + beatsPerMinute)/2  ;
+               }  
+               tsLastReport = millis();
             }
-          }
         }
-        if(validSPO2 == 1 && spo2 < 100 && spo2 > 0){
-          sp02Avg = (sp02Avg+spo2)/2;
-        }
-        Serial.print(F("HR="));
-        Serial.print(heartRate, DEC);
-        Serial.print(F("\t HRAVG="));
-        Serial.print(beatAvg, DEC);
-        Serial.print(F("\t HRvalid="));
-        Serial.print(validHeartRate, DEC);
-        Serial.print(F("\t SPO2="));
-        Serial.print( spo2 , DEC);
-        Serial.print(F("\t SPO2AVG="));
-        Serial.print( sp02Avg , DEC);
-        Serial.print(F("\t SPO2Valid="));
-        Serial.println(validSPO2, DEC);
      }
      if(SensorTemp){
-         if ( millis() - oldTMed > 5000 ) {
+         if ( millis() - oldTMed > REPORTING_PERIOD_TEMP_MS ) {
            //Serial.print("Sensor Temp Emisividad = "); Serial.println(mlx.readEmissivity());
            valtemp=mlx.readObjectTempC();
            valtempamb=mlx.readAmbientTempC();
            oldTMed = millis();
          }
      }
-    vTaskDelay(20);
-  }else{
-    vTaskDelay(500);
+    buclepuls=true;
+    vTaskDelay(10);
   }
- }
 }
 
 void conf_default(void) {
@@ -562,6 +506,30 @@ void setup( void ) {
   pinMode(21,INPUT_PULLUP);
   pinMode(22,INPUT_PULLUP);
   delay(500);
+  if (mlx.begin()) {
+    SensorTemp=true;
+    //mlx.writeEmissivity(new_emissivity);
+    senstemp="Conectado";
+    Serial.print("Sensor Temp Emisividad Temp TempAmb = "); Serial.print(mlx.readEmissivity());//Serial.print(mlx.readObjectTempC());Serial.println(mlx.readAmbientTempC());
+  }else{
+    Serial.println("Error el Sensor de Temperatura DESCONECTADO.");
+    senstemp="Desconectado";
+    SensorTemp=false;
+  }
+  delay(500);
+  //Wire, I2C_SPEED_FAST
+  if (pox.begin()){
+    SensorPulso=true;
+    senspuls="Conectado";
+    pox.setIRLedCurrent(IRLEDCURR);
+    pox.setOnBeatDetectedCallback(onBeatDetected);
+    Serial.println("Sensor de PULSO Conectado.");
+  }else{
+    Serial.println("Error el Sensor de PULSO DESCONECTADO.");
+    SensorPulso=false;
+    senspuls="Desconectado";
+  }
+  delay(500);
   
   analogReadResolution(12); //12 bits
   analogSetAttenuation(ADC_11db);  //For all pins
@@ -690,20 +658,19 @@ void loop( void ) {
         ESPUI.addGraphPoint(graphIdTemp, valtemp);
       }
     }
-    //spo2 heartRate beatAvg sp02Avg
-       
+           
     if(SensorPulso){
-      Serial.print("heartrate/HRAv = "); Serial.print(heartRate);Serial.print("/");Serial.print(beatAvg);
+      Serial.print("heartrate/HRAv = "); Serial.print(beatsPerMinute);Serial.print("/");Serial.print(beatAvg);
       Serial.print("\t SPO2= "); Serial.print(spo2); ;Serial.print("/");Serial.print(sp02Avg);Serial.println("*C");
       if (switchOne){
-        ESPUI.addGraphPoint(graphIdPulso, heartRate);
+        ESPUI.addGraphPoint(graphIdPulso, beatsPerMinute);
         ESPUI.addGraphPoint(graphIdSPO, spo2);
       }
     }
     Serial.println("loop Nucleo:" + String(xPortGetCoreID()));
     //int32_t spo, int32_t hr, int spoav, int hrav, float v, float temp
     vcc=get_vcc();
-    send_mqtt(spo2,heartRate,sp02Avg,beatAvg,vcc,valtemp);
+    send_mqtt(spo2,beatsPerMinute,sp02Avg,beatAvg,vcc,valtemp);
     oldTMed = millis();
   }
 }
