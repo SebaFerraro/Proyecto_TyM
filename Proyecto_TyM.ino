@@ -7,6 +7,9 @@
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
 #include "MAX30100_PulseOximeter.h"
+#include "FS.h"
+#include "SPIFFS.h"
+#include <ESPAsyncWebServer.h>
 
 TaskHandle_t Tareacore0;
 const byte DNS_PORT = 53;
@@ -16,15 +19,17 @@ Preferences preference;
 Adafruit_MLX90614 mlx = Adafruit_MLX90614();
 double new_emissivity = 0.98;
 PulseOximeter pox;
+AsyncWebServer server(81);
 
-#define ANALOG_PIN_0 34 
-#define POXLEDIC MAX30100_LED_CURR_20_8MA
-#define LEDPULSO 2 
+#define ANALOG_PIN_0 34 //Define el pin donde medimos tension de bateria
+#define POXLEDIC MAX30100_LED_CURR_20_8MA  //define la corriente de los leds de Max30100
+#define LEDPULSO 2 //Define pin de led de destello de latido
 
 float PPM=0;
 int32_t SPO=0; //SPO2 value
 int PPMAv = 0, SPOAv = 0; //stores the average BPM and SPO2 
 
+//variables de configuracion del dispositivo
 const char* hostname = "espui";
 String usuario;
 String password;
@@ -43,11 +48,14 @@ unsigned long versionc;
 uint16_t button1;
 bool switchOne;
 bool guarda=false;
-uint16_t cversion, cpulsostat, ctempstat, cwifistat, cntpstat, cmqttstat, csave;
+bool valid=false;
+bool spifs=true;
+uint16_t cversion, cpulsostat, ctempstat, cwifistat, cntpstat, cmqttstat, csave, cleearch, cborrarch, cmensaj;
 uint16_t pmedid, pguardid,dtatempgid,dtapulsoid,dtaspoid,graficarid,wifissidid,wifipassid,mqttserverid,tokenid,usuarioid,passwordid;
 int graphIdTemp, graphIdPulso, graphIdSPO;
 String wmode;
 String horaloc;
+String mensaje;
 float valtemp=0;
 float valtempamb=0;
 float vcc=0;
@@ -63,6 +71,11 @@ bool SensorPulso = false;
 WiFiClient espClient;
 PubSubClient client(espClient);
 
+void notFound(AsyncWebServerRequest *request) {
+    request->send(404, "text/plain", "Not found");
+}
+
+//Describe eventos wifi
 void WiFiEvent(WiFiEvent_t event){
     Serial.printf("[WiFi-event] event: %d\n", event);
     Serial.println("WiFiEvent Nucleo:" + String(xPortGetCoreID()));
@@ -154,6 +167,7 @@ void WiFiEvent(WiFiEvent_t event){
     }
  }
 
+//Muestra en que modo esta el dispositivo para mostrarlo en la web
 String modo_wifi(void){
   int wm= WiFi.getMode();
   String salida="";
@@ -176,21 +190,25 @@ String modo_wifi(void){
   return salida;
 }
 
-void guarda_datos(long timestamp ,int32_t spo, int32_t hr, int spoav, int hrav, float v, float temp){
-  Serial.print("Guarda Datos.");
+//Guarda datos en filesystem flash
+void guarda_datos(String timestamp ,int32_t spo, int32_t hr, int spoav, int hrav, float v, float temp){
+  String dat = timestamp + ";" + String(spo) + ";" + String(hr) + ";"+ String(spoav) + ";"+ String(hrav) + ";"+ String(v) + ";"+ String(temp) + "\n";
+  appendFile(SPIFFS, "/datos.txt", dat.c_str());
+  Serial.print("Guarda Datos en datos.txt:" + dat);
 }
 
+//Envia datos por MQTT
 void send_mqtt(int32_t spo, int32_t hr, int spoav, int hrav, float v, float temp){
   Serial.println("sendmqtt Nucleo:" + String(xPortGetCoreID()));
   if(!client.connected()) {
       ESPUI.updateControlValue( cmqttstat, "Desconectado." );
       Serial.print("Conectando ThingsBoard node ...");
       if ( client.connect("BrazaleteSmart01", token.c_str(), NULL) ) {
-        Serial.println( "[DONE]" );
+        Serial.println( "[OK]" );
         delay(1000);
       } else {
-        Serial.print( "[FAILED] [ rc = " );
-        Serial.print( client.state() );
+        Serial.print( "[ERROR] [ rc = " );
+        Serial.println( client.state() );
       }
     }  
     if (client.connected()) {
@@ -228,27 +246,30 @@ void send_mqtt(int32_t spo, int32_t hr, int spoav, int hrav, float v, float temp
       Serial.print( "Publish : ");
       Serial.println(rsus);
       Serial.println( attributes );
-    }else{
-      Serial.print("Guarda en archivo");
     }
   }
 
+//Lee tension de bateria
 float get_vcc(){
   Serial.println("getvcc Nucleo:" + String(xPortGetCoreID()));
   int steps=analogRead(ANALOG_PIN_0);
   Serial.print("Voltage Steps = ");
   Serial.println(steps);
-  float VBAT = 3.90f * float(steps) / 4096.0f *2;  // LiPo battery
+  //float VBAT = 3.90f * float(steps) / 4096.0f *2;  // LiPo battery
+  float VBAT = 4.91f * float(steps) * 4.35f /4096.0f ;  // LiPo battery
+  
   return VBAT;
 }
 
+//Callback por latido destella led
 void onBeatDetected()
 {
-    Serial.println("Pulso! Nucleo:" + String(xPortGetCoreID()));
+    //Serial.println("Pulso! Nucleo:" + String(xPortGetCoreID()));
     digitalWrite(LEDPULSO,HIGH);
     tledpuls=millis();
 }
 
+//Otro hilo de ejecucion para asegurar muestreo de 100hz de Max30100
 void correcore0( void * parameter) {
   Serial.println("Correcore0 Nucleo:" + String(xPortGetCoreID()));
   static long oldTMed = 0;
@@ -267,6 +288,7 @@ void correcore0( void * parameter) {
   }
 }
 
+//Pone conf por defecto
 void conf_default(void) {
   preference.putString("usuario", "admin");
   preference.putString("password", "admin");
@@ -282,6 +304,7 @@ void conf_default(void) {
   preference.putULong("version", 1);
 }
 
+//Guarda Configuracion
 void conf_save(void) {
   Serial.println("ConfSave Nucleo:" + String(xPortGetCoreID()));
   preference.putString("usuario",usuario );
@@ -299,6 +322,7 @@ void conf_save(void) {
   preference.putULong("version", versionc);
 }
 
+//Carga Configuracion
 bool get_conf(void) {
   preference.begin("configuracion", false);
   Serial.println("GetConf Nucleo:" + String(xPortGetCoreID()));
@@ -324,11 +348,13 @@ bool get_conf(void) {
   }
 }
 
+//Muestra ids de controles web
 void muestra_ids(){
   Serial.println("MuestraIds Nucleo:" + String(xPortGetCoreID()));
   Serial.println(" cversion:" + String(cversion) + " cpulsostat:" + String(cpulsostat) + " ctempstat:" + String(ctempstat) + " cwifistat:" + String(cwifistat) + " cntpstat:" + String(cntpstat) + " cmqttstat:" + String(cmqttstat) + " pmedid:" + String(pmedid) + " pguardid:" + String(pguardid) + " dtatempgid:" + String(dtatempgid) + " dtapulsoid:" + String(dtapulsoid) + " dtaspoid:" + String(dtaspoid) + " graficarid:" + String(graficarid) + " wifissidid:" + String(wifissidid) + " wifipassid:" + String(wifipassid) + " mqttserverid:" + String(mqttserverid) + " tokenid:" + String(tokenid) + " usuarioid:" +  String(usuarioid) + " passwordid:" + String(passwordid) + " graphIdTemp:" + String(graphIdTemp) + " graphIdPulso:" + String(graphIdPulso) + " graphIdSPO:" + String(graphIdSPO));
 }
 
+//Funciones que son llamdas por los controles web
 void numero_func( Control* sender, int type ) {
   Serial.println("NumberCall Nucleo:" + String(xPortGetCoreID()));
   Serial.print("Num: ID: ");
@@ -412,6 +438,51 @@ void boton_func( Control* sender, int type ) {
   }
 }
 
+void borrarch_func( Control* sender, int type ) {
+  Serial.println("borrarch_func Nucleo:" + String(xPortGetCoreID()));
+  Serial.print("Boton: ID: ");
+  Serial.print(sender->id);
+  Serial.print(", Value: ");
+  Serial.print( sender->value );
+  Serial.print(", Type: ");
+  Serial.println( type );
+  switch ( type ) {
+    case B_DOWN:
+      Serial.println( "Borrach DOWN" );
+      deleteFile(SPIFFS, "/datos.txt");
+      conf_save();
+      ESPUI.updateControlValue( cmensaj, "Archivo datos.txt eliminado." );
+      break;
+    case B_UP:
+      Serial.println( "Borrarch UP" );
+      break;
+  }
+}
+
+void leearch_func( Control* sender, int type ) {
+  Serial.println("leearch_func Nucleo:" + String(xPortGetCoreID()));
+  Serial.print("Boton: ID: ");
+  Serial.print(sender->id);
+  Serial.print(", Value: ");
+  Serial.print( sender->value );
+  Serial.print(", Type: ");
+  Serial.println( type );
+  size_t len=0;
+  String sal;
+  switch ( type ) {
+    case B_DOWN:
+      Serial.println( "leearch DOWN" );
+      len=sizeFile(SPIFFS, "/datos.txt");
+      sal="Tamaño:" + String(len) +"bytes\nDescarga http://" + WiFi.localIP().toString() + ":81/datos.txt";
+      Serial.println(sal);
+      ESPUI.updateControlValue( cmensaj, sal );
+      break;
+    case B_UP:
+      Serial.println( "leearch UP" );
+      break;
+  }
+}
+
 void switch_func( Control* sender, int value ) {
   Serial.println("switch_func Nucleo:" + String(xPortGetCoreID()));
   switch ( value ) {
@@ -428,7 +499,7 @@ void switch_func( Control* sender, int value ) {
   Serial.println( sender->id );
 }
 
-
+//Formatea fecha para web
 String tiempolocal(){
   Serial.println("tiempolocal Nucleo:" + String(xPortGetCoreID()));
   struct tm timeinfo;
@@ -445,6 +516,63 @@ String tiempolocal(){
   return sh;
 }
 
+//devuelve el tamaño del archivo de datos
+size_t sizeFile(fs::FS &fs, const char * path){
+    Serial.printf("Leyendo archivo: %s\n", path);
+    size_t len =0;
+    File file = fs.open(path);
+    if(!file){
+        Serial.println("Error abriendo archivo.");
+        return len;
+    }
+
+    Serial.print("Archivo leido: ");
+    len=file.size();
+    file.close();
+    return len;
+}
+
+
+//Agrega datos al archivo      
+void appendFile(fs::FS &fs, const char * path, const char * message){
+    Serial.printf("Agregando al archivo: %s\n", path);
+
+    File file = fs.open(path, FILE_APPEND);
+    if(!file){
+        Serial.println("Error Abriendo el archivo!");
+        return;
+    }else{
+      if(!file.isDirectory()){
+        size_t len =0;
+        len = file.size();
+        Serial.print("Tamaño Archivo datos.txt:");
+        Serial.println(len);
+        if(len < 10000 ){   
+          if(file.print(message)){
+             Serial.println("Dato Agregado");
+          } else {
+             Serial.println("Error agregando Datos.");
+          }
+        }else{
+          Serial.println("Error Archivo supera el tamaño permitido.");
+        }
+      }else{
+        Serial.println("Error Es un directorio.");
+      }
+      file.close();
+    }
+}
+
+//borra archivo de datos
+void deleteFile(fs::FS &fs, const char * path){
+    Serial.printf("Deleting file: %s\n", path);
+    if(fs.remove(path)){
+        Serial.println("Archivo borrado.");
+    } else {
+        Serial.println("Error borrando archivo.");
+    }
+}
+
 void setup( void ) {
   Serial.begin( 115200 );
   Serial.println("setup Nucleo:" + String(xPortGetCoreID()));
@@ -455,7 +583,15 @@ void setup( void ) {
   pinMode(LEDPULSO,OUTPUT);
   //Wire.begin();
   //Wire.setClock(100000);
+  //Monta filesystem flash
+  if(!SPIFFS.begin()){
+        Serial.println("Error al montar Filesystem.");
+        spifs=false;
+  }
+  Serial.print("Estado Filesystem:");
+  Serial.println(String(spifs));
   delay(500);
+  //Inicializa sensor Max30100 y marca estado en bandera SensorPulso
   if (pox.begin()){
     SensorPulso=true;
     senspuls="Conectado";
@@ -468,6 +604,7 @@ void setup( void ) {
     senspuls="Desconectado";
   }
   delay(500);
+  //Inicializa sensor mlx90614 y marca estado en bandera SensorTemp
   if (mlx.begin()) {
     SensorTemp=true;
     //mlx.writeEmissivity(new_emissivity);
@@ -482,15 +619,18 @@ void setup( void ) {
   }
   delay(500);
   //Wire, I2C_SPEED_FAST
+  //Configura adc para medir tension de bateria
   analogReadResolution(12); //12 bits
   analogSetAttenuation(ADC_11db);  //For all pins
   analogSetPinAttenuation(ANALOG_PIN_0, ADC_11db); //0db attenu
   delay(400);
   WiFi.onEvent(WiFiEvent);
+  //carga configuracion
   bool sal = get_conf();
   if (! sal ) {
     Serial.println("No habia configuracion.");
   }
+  //Inicia WIFI
   WiFi.setHostname( hostname );
   WiFi.begin( ssid.c_str(), pass.c_str());
   Serial.print( "\n\nTry to connect to existing network" );
@@ -501,7 +641,8 @@ void setup( void ) {
     timeout--;
   } while ( timeout && WiFi.status() != WL_CONNECTED );
   if ( WiFi.status() != WL_CONNECTED ) {
-    Serial.print( "\n\nCreating hotspot" );
+    //No se pudo conectar a la señal configurada inicia modo AP
+    Serial.print( "\n\nCreando hotspot" );
     WiFi.mode( WIFI_AP );
     WiFi.softAPConfig( apIP, apIP, IPAddress( 255, 255, 255, 0 ) );
     WiFi.softAP("BrazaleteSmart"); //ssid.c_str()
@@ -516,16 +657,24 @@ void setup( void ) {
   Serial.print( "\n\nWiFi parametros:" );
   wmode=modo_wifi();
   Serial.println( wmode );
+  //Configura la fecha y hora por protocolo NTP
   configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
   horaloc=tiempolocal();
+  //Configura cliente MQTT
   client.setServer(mqttserver.c_str(), 1884);
+  //Arranca 2do hilo de ejecucion
   xTaskCreatePinnedToCore(correcore0,"TareaCore0",10000,NULL,1,&Tareacore0,1);
+  //Configura 3 pestañas en la interface web
   uint16_t tab1 = ESPUI.addControl( ControlType::Tab, "datos", "Datos" );
   uint16_t tab2 = ESPUI.addControl( ControlType::Tab, "conexion", "Conexion" );
+  uint16_t tab3 = ESPUI.addControl( ControlType::Tab, "archivos", "Archivos" );
   Serial.print("tab1 :");
   Serial.print(tab1);
   Serial.print(" tab2 :");
-  Serial.println(tab2);
+  Serial.print(tab2);
+  Serial.print(" tab3 :");
+  Serial.println(tab3);
+  //Agrega todos los controles a la interface web
   cversion = ESPUI.addControl( ControlType::Label, "Conf Version:", String(versionc), ControlColor::Turquoise );
   cpulsostat = ESPUI.addControl( ControlType::Label, "Sensor Pulso:", senspuls, ControlColor::Turquoise );
   ctempstat = ESPUI.addControl( ControlType::Label, "Sensor Temperatura:", senstemp, ControlColor::Turquoise );
@@ -533,6 +682,10 @@ void setup( void ) {
   cntpstat = ESPUI.addControl( ControlType::Label, "Servidor NTP:", horaloc, ControlColor::Turquoise );
   cmqttstat = ESPUI.addControl( ControlType::Label, "Servidor MQTT", "Desconectado", ControlColor::Turquoise );
   csave = ESPUI.addControl(ControlType::Button, "Configuracion", "Guardar", ControlColor::Turquoise, Control::noParent,&boton_func );
+  
+  cborrarch = ESPUI.addControl(ControlType::Button, "Borrar Archivo", "Borrar", ControlColor::Turquoise, tab3,&borrarch_func );
+  cleearch = ESPUI.addControl(ControlType::Button, "Leer Archivo", "Leer", ControlColor::Turquoise, tab3,&leearch_func );
+  cmensaj = ESPUI.addControl( ControlType::Label, "Status:", mensaje, ControlColor::Turquoise, tab3 );
   
   dtatempgid=ESPUI.addControl( ControlType::Slider, "Dif Temp Guarda", String(dtatempg), ControlColor::Peterriver, tab1, &slider_func );
   dtapulsoid=ESPUI.addControl( ControlType::Slider, "Dif Pulso Guarda", String(dtapulso), ControlColor::Peterriver, tab1, &slider_func );
@@ -553,6 +706,14 @@ void setup( void ) {
   graphIdSPO = ESPUI.addControl( ControlType::Graph, "SPO", "", ControlColor::Peterriver,tab1);
   ESPUI.begin("Brazalete SMART", usuario.c_str(), password.c_str());
   muestra_ids();
+  //Arranca un servidor web asincrono en puerto 81 para descarga de archivo de datos
+  server.on("/datos.txt", HTTP_GET, [](AsyncWebServerRequest *request){
+  Serial.println(" /datos.txt pedidos ...");
+  AsyncWebServerResponse *response = request->beginResponse(SPIFFS, "/datos.txt", "text/plain", true);
+  request->send(response);
+});
+  server.onNotFound(notFound);
+  server.begin();
 }
 
 void loop( void ) {
@@ -564,15 +725,23 @@ void loop( void ) {
   float dtemp=0;
   float dppm=0;
   float dspo=0;
+  float apa=0;
   int32_t spoi=0; //SPO2 value
+  valid=false;
+  guarda=false;
+  //Conprueba periodo configurado de medicion  
   if ( millis() - oldTMed >  (pmed * 1000 )) {
     if(SensorTemp){
+      //lee valores del sensor Temp
       valtempi=mlx.readObjectTempC();
       valtempambi=mlx.readAmbientTempC();
       if(!isnan(valtempi)){
-        dtemp=1-(valtempi/valtemp);
-        if(dtemp > dtatempg/100 ){
-          guarda=true;
+        if(valtemp != 0){
+          dtemp=abs(1-(valtempi/valtemp));
+          if(dtemp > float(dtatempg)/100 ){
+            Serial.print("Guarda TRUE TEMP");
+            guarda=true;
+          }
         }
         valtemp=valtempi;
       }
@@ -582,6 +751,7 @@ void loop( void ) {
       Serial.print("Ambiente = "); Serial.print(valtempamb);
       Serial.print("*C\tObjeto = "); Serial.print(valtemp); Serial.println("*C");
       if (switchOne){
+        //
         ESPUI.addGraphPoint(graphIdTemp, valtemp);
       }
     }
@@ -589,17 +759,25 @@ void loop( void ) {
       ppmi=pox.getHeartRate();
       spoi=pox.getSpO2();
       if (ppmi < 255 && ppmi > 30){
-        dppm=1-(ppmi/PPM);
-        if(dppm > dtapulso/100 ){
-          guarda=true;
+        valid=true;
+        if(PPM != 0){
+           dppm=abs(1-(ppmi/PPM));
+           if(dppm > float(dtapulso)/100 ){
+             Serial.print("Guarda TRUE PPM");
+             guarda=true;
+           }
         }
         PPMAv=(PPMAv + ppmi)/2;
         PPM=ppmi;
       }
       if (spoi < 101 && spoi > 70){
-        dspo=1-(spoi/SPO);
-        if(dspo > dtaspo/100 ){
-          guarda=true;
+        valid=true;
+        if(SPO != 0){
+          dspo=abs(1-(float(spoi)/float(SPO)));
+          if(dspo > float(dtaspo)/100 ){
+            Serial.print("Guarda TRUE SPO");
+            guarda=true;
+          }
         }
         SPOAv=(SPOAv + spoi)/2;
         SPO=spoi;
@@ -614,19 +792,26 @@ void loop( void ) {
         ESPUI.addGraphPoint(graphIdSPO, SPO);
       }
     }
-    Serial.println("loop Nucleo:" + String(xPortGetCoreID()));
+    //Serial.println("loop Nucleo:" + String(xPortGetCoreID()));
     vcc=get_vcc();
     if (SPO != 0 || PPM != 0 || valtemp != 0){
        send_mqtt(SPO,PPM,SPOAv,PPMAv,vcc,valtemp);
     }
     if(!client.connected()) {
-      if((millis() - oldTGuard >  (pguard * 1000 )) || (guarda)){
-         guarda_datos(SPO,PPM,SPOAv,PPMAv,vcc,valtemp);
+      Serial.print("Gurda ? tiempo:");
+      Serial.print(millis() - oldTGuard);
+      Serial.print(" dta:");
+      Serial.println(guarda);
+      if(((millis() - oldTGuard >  (pguard * 1000 )) || (guarda)) && spifs){
+         horaloc=tiempolocal();
+         guarda_datos(horaloc,SPO,PPM,SPOAv,PPMAv,vcc,valtemp);
          oldTGuard = millis();    
       }
+      
     }
+    vTaskDelay(40);
     oldTMed = millis();
   }else{
-    vTaskDelay(100); 
+    vTaskDelay(200); 
   }
 }
